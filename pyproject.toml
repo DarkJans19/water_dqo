@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "water-contamination-algorithm"
+version = "0.1.0"
+description = "Water quality contamination diagnosis and forecasting algorithms"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "tensorflow==2.16.1",
+    "numpy>=1.23.5,<2.0",
+    "pandas>=2.2",
+    "scikit-learn",
+    "xgboost",
+    "shap==0.44.1",
+    "matplotlib",
+]
+
+[tool.setuptools]
+py-modules = ["Diagnosis_Algorithms", "LSTM_Algorithm", "Data_Manage", "XGBoost_Algorithm", "SVM_Algorithm", "SpatioTemporal_Evaluation", "SpatioTemporal_Plots", "Error_Analysis", "Performance_Diagnostics", "Model_Selection", "Regional_Evaluation", "Experiment_Proposals"]
+
+[project.optional-dependencies]
+notebook = ["ipykernel", "jupyterlab"]
