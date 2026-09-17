@@ -45,6 +45,39 @@ test. La opción permanece reproducible para análisis de sensibilidad, pero el
 flujo recomendado excluye censura. Una continuación razonable es una pérdida
 censurada/Tobit o de intervalo, evaluada con múltiples cortes.
 
+## Intento que no aportó: pesos y perfil regional
+
+Se comprobó la propuesta de priorizar la subzona `2,120`, que contiene sectores
+del río Bogotá y Soacha. No se eligió por los datos de prueba: en entrenamiento
+tenía 215 ejemplos de nueve estaciones y una DQO media de 98,30 mg O2/L; en
+validación tenía 83 ejemplos. El ID de estación ya estaba excluido de los
+predictores antes del experimento.
+
+Se compararon en las mismas 877 observaciones de validación: pesos 2, 3 y 5 para
+la subzona `2,120`; codificación de zona, subzona y banda altitudinal agrupando
+categorías con menos de 20 ejemplos de entrenamiento; y cuatro configuraciones
+de XGBoost con menor profundidad y penalizaciones L1/L2 más fuertes.
+
+| Variante XGBoost | RMSE global validación | RMSE subzona 2,120 |
+|---|---:|---:|
+| Modelo conservado | **35,451** | **77,830** |
+| Peso 2 | 36,840 | 84,189 |
+| Peso 3 | 37,911 | 86,772 |
+| Peso 5 | 37,844 | 88,471 |
+| Perfil regional como predictor | 37,355 | 84,443 |
+| Mejor regularización adicional (profundidad 4) | 36,570 | 81,847 |
+
+El modelo conservado ganó tanto con RMSE global como con un RMSE de validación
+que ponderaba por cinco la subzona prioritaria. Por ello no se consultó prueba
+para ordenar las alternativas y no se incorporaron al pipeline. Los pesos no
+crean información nueva: cambian el costo de los errores y, en este caso,
+aumentaron incluso el error de la región priorizada. La regionalización continúa
+en la evaluación, donde sí ayuda a localizar el problema sin degradar el modelo.
+
+La mitigación LSTM ya adoptada permanece: 32 unidades, dropout 0,3, parada
+temprana sobre RMSE físico y restauración del mejor peso. Aumentar dropout sin
+evidencia adicional no se adopta, porque también puede provocar subajuste.
+
 ## Evaluación regional
 
 Se añadieron zona y subzona hidrográfica informadas por el CSV y bandas de
