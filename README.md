@@ -104,6 +104,9 @@ XGBoost ganó MAE en las cinco: MAE medio 17,991 (DE 0,270), frente a 18,702
 (DE 0,716) para LSTM. La desviación entre predicciones de semillas tuvo percentil
 95 de 8,757 mg O2/L en XGBoost y 20,652 en LSTM. La semilla 42 deja de ser la base
 única de la conclusión: XGBoost resulta mejor y más estable en este experimento.
+El sesgo de DQO alta fue negativo en las cinco semillas para ambos modelos:
+−36,655 mg O2/L en promedio para XGBoost y −42,685 para LSTM. Por tanto, variar
+la inicialización tampoco elimina la compresión de los valores extremos.
 
 ### Disponibilidad real de predictores
 

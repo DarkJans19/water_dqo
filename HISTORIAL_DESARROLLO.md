@@ -21,6 +21,20 @@ sus nombres originales para mantener trazabilidad.
 - Test ya fue inspeccionado durante el desarrollo. Nuevas mejoras requieren otro
   período o varios orígenes temporales para considerarse confirmadas.
 
+## Cierre de robustez y aplicabilidad
+
+- Cinco semillas (7, 21, 42, 84 y 123) con configuraciones congeladas: XGBoost
+  ganó MAE en las cinco, con 17,991 ± 0,270; LSTM obtuvo 18,702 ± 0,716.
+- El sesgo de DQO alta permaneció negativo en todas las semillas: promedio
+  −36,655 para XGBoost y −42,685 para LSTM. La inicialización no explica el fallo.
+- Las 13 covariables químicas contemporáneas quedan con disponibilidad
+  `unverified`. Un manifiesto incompleto impide autorizar el modelo operacional.
+- La sensibilidad con cinco candidatos de campo por nombre obtuvo MAE 19,651 y
+  R² 0,579 en test. No certifica que estén disponibles antes que DQO.
+- Las temporadas son etiquetas de calendario y no clima observado.
+- La confirmación externa queda reservada para observaciones posteriores al
+  23-11-2024, con configuración congelada y sin reutilizar 2020–2024 como prueba.
+
 ## Resultados y decisiones
 
 | Modelo/configuración | MAE test | RMSE test | R² test | Decisión |
