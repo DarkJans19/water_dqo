@@ -1,6 +1,7 @@
 """Diagnóstico descriptivo reproducible; ninguna selección se hace sobre test."""
 import numpy as np
 import pandas as pd
+from itertools import combinations
 
 
 def resumen_metricas(y, prediction):
@@ -9,10 +10,96 @@ def resumen_metricas(y, prediction):
     denominator = np.square(y-y.mean()).sum()
     return dict(N=len(y), MAE=float(np.abs(residual).mean()),
                 RMSE=float(np.sqrt(np.square(residual).mean())),
-                R2=float(1-np.square(residual).sum()/denominator) if len(y)>1 and denominator>0 else np.nan)
+                R2=float(1-np.square(residual).sum()/denominator) if len(y)>1 and denominator>0 else np.nan,
+                bias=float(residual.mean()),
+                median_absolute_error=float(np.median(np.abs(residual))),
+                underestimation_pct=float(100*np.mean(residual < 0)),
+                overestimation_pct=float(100*np.mean(residual > 0)))
 
 
-def diagnosticar_desempeno(prepared, predictions):
+def resumen_macro_estaciones(station_metrics: pd.DataFrame) -> pd.DataFrame:
+    """Contraste entre agregación por observaciones y por estaciones.
+
+    El resumen macro usa sólo estaciones con evidencia mínima según la bandera
+    ya calculada, e informa explícitamente cuántas observaciones quedan fuera.
+    """
+    required = {"model", "split", "station", "N", "MAE", "RMSE", "bias", "insufficient_samples"}
+    missing = required - set(station_metrics)
+    if missing:
+        raise ValueError(f"Faltan columnas de métricas por estación: {sorted(missing)}")
+    rows = []
+    for (model, split), group in station_metrics.groupby(["model", "split"], sort=True):
+        usable = group.loc[~group["insufficient_samples"]]
+        rows.append({
+            "model": model, "split": split,
+            "stations_total": int(len(group)),
+            "stations_with_sufficient_evidence": int(len(usable)),
+            "N_total": int(group["N"].sum()),
+            "N_in_macro": int(usable["N"].sum()),
+            "observation_weighted_MAE_in_macro": float(np.average(usable["MAE"], weights=usable["N"])) if len(usable) else np.nan,
+            "macro_mean_MAE": float(usable["MAE"].mean()) if len(usable) else np.nan,
+            "macro_median_MAE": float(usable["MAE"].median()) if len(usable) else np.nan,
+            "macro_mean_RMSE": float(usable["RMSE"].mean()) if len(usable) else np.nan,
+            "macro_mean_bias": float(usable["bias"].mean()) if len(usable) else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def incertidumbre_diferencias_modelos(predictions: pd.DataFrame, *, n_bootstrap=2000, random_state=42):
+    """IC percentil pareado, remuestreando estaciones completas.
+
+    Preserva la dependencia temporal dentro de estación. Una diferencia menor
+    que cero favorece al primer modelo indicado en la fila.
+    """
+    if not isinstance(n_bootstrap, int) or n_bootstrap < 100:
+        raise ValueError("n_bootstrap debe ser un entero >= 100.")
+    rng = np.random.default_rng(random_state)
+    rows = []
+    for split, split_frame in predictions.groupby("split", sort=True):
+        models = sorted(split_frame["model"].unique())
+        truth = split_frame.drop_duplicates("sample_id").set_index("sample_id")["y_true"]
+        station = split_frame.drop_duplicates("sample_id").set_index("sample_id")["station"]
+        pred = split_frame.pivot(index="sample_id", columns="model", values="y_pred").reindex(truth.index)
+        if pred.isna().any().any():
+            raise ValueError("La incertidumbre pareada requiere la misma cohorte en todos los modelos.")
+        station_names = station.unique()
+        for model_a, model_b in combinations(models, 2):
+            aggregate = []
+            for station_name in station_names:
+                mask = station.eq(station_name).to_numpy()
+                observed = truth.to_numpy()[mask]
+                error_a = pred[model_a].to_numpy()[mask] - observed
+                error_b = pred[model_b].to_numpy()[mask] - observed
+                aggregate.append((mask.sum(), np.abs(error_a).sum(), np.abs(error_b).sum(),
+                                  np.square(error_a).sum(), np.square(error_b).sum(),
+                                  error_a.sum(), error_b.sum()))
+            aggregate = np.asarray(aggregate, dtype=float)
+            draws = rng.integers(0, len(aggregate), size=(n_bootstrap, len(aggregate)))
+            sampled = aggregate[draws].sum(axis=1)
+            n = sampled[:, 0]
+            boot = {
+                "MAE": sampled[:, 1]/n - sampled[:, 2]/n,
+                "RMSE": np.sqrt(sampled[:, 3]/n) - np.sqrt(sampled[:, 4]/n),
+                "bias": sampled[:, 5]/n - sampled[:, 6]/n,
+            }
+            full_n = aggregate[:, 0].sum()
+            point = {
+                "MAE": aggregate[:, 1].sum()/full_n - aggregate[:, 2].sum()/full_n,
+                "RMSE": np.sqrt(aggregate[:, 3].sum()/full_n) - np.sqrt(aggregate[:, 4].sum()/full_n),
+                "bias": aggregate[:, 5].sum()/full_n - aggregate[:, 6].sum()/full_n,
+            }
+            for metric, values in boot.items():
+                low, high = np.quantile(values, [0.025, 0.975])
+                rows.append({"split": split, "model_a": model_a, "model_b": model_b,
+                             "metric": metric, "difference_a_minus_b": float(point[metric]),
+                             "ci95_low": float(low), "ci95_high": float(high),
+                             "probability_a_better": float(np.mean(values < 0)),
+                             "stations": len(station_names), "N": int(full_n),
+                             "bootstrap_unit": "station", "n_bootstrap": n_bootstrap})
+    return pd.DataFrame(rows)
+
+
+def diagnosticar_desempeno(prepared, predictions, station_metrics=None, *, n_bootstrap=2000, random_state=42):
     frame = prepared.frame
     train = prepared.partitions['train'].metadata
     partitions = []
@@ -67,9 +154,15 @@ def diagnosticar_desempeno(prepared, predictions):
         ('Visitas: estación + fecha/hora únicas', len(frame)),
         ('Visitas con etiqueta DQO utilizable', int(frame.y_true.notna().sum())),
         ('Etiquetas sin historial suficiente', int((frame.y_true.notna() & ~frame.eligible).sum())),
-        ('Ejemplos elegibles (train + validation + test)', int(frame.eligible.sum())),
+        ('Ejemplos elegibles dentro de la evaluación', int((frame.eligible & frame.split.isin(['train','validation','test'])).sum())),
+        ('Ejemplos elegibles fuera de la ventana', int((frame.eligible & ~frame.split.isin(['train','validation','test'])).sum())),
         *[(f'Ejemplos {s}',len(p.y)) for s,p in prepared.partitions.items()],
     ],columns=['etapa','cantidad'])
+    station_macro = resumen_macro_estaciones(station_metrics) if station_metrics is not None else pd.DataFrame()
+    model_uncertainty = incertidumbre_diferencias_modelos(
+        predictions, n_bootstrap=n_bootstrap, random_state=random_state
+    ) if predictions.model.nunique() > 1 else pd.DataFrame()
     return dict(sample_flow=sample_flow, partitions=pd.DataFrame(partitions), baselines=pd.DataFrame(baseline_rows),
                 error_concentration=pd.DataFrame(concentration), station_generalization=pd.DataFrame(generalization),
+                station_macro=station_macro, model_difference_uncertainty=model_uncertainty,
                 feature_missingness=missing, observations=observations)

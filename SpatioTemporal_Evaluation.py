@@ -17,7 +17,7 @@ import pandas as pd
 METADATA_COLUMNS = (
     "sample_id", "station", "date", "latitude", "longitude", "elevation",
     "year", "month", "season", "season_source", "gap_days", "history_count",
-    "target_censored",
+    "target_censored", "hydro_zone", "hydro_subzone", "altitude_band",
 )
 GROUP_LEVELS = {
     "global": [],
@@ -28,6 +28,9 @@ GROUP_LEVELS = {
     "station_year": ["station", "year"],
     "station_season": ["station", "season"],
     "station_year_season": ["station", "year", "season"],
+    "hydro_zone_year": ["hydro_zone", "year"],
+    "hydro_subzone_year": ["hydro_subzone", "year"],
+    "altitude_band_year": ["altitude_band", "year"],
 }
 
 
@@ -180,6 +183,11 @@ def _group_metrics(group: pd.DataFrame, min_samples: int) -> dict:
         "RMSE": float(np.sqrt(np.mean(np.square(error)))),
         "R2": float(r2),
         "R2_reported": float(r2) if n >= min_samples else np.nan,
+        "bias": float(np.mean(error)),
+        "median_absolute_error": float(np.median(np.abs(error))),
+        "underestimation_pct": float(100.0 * np.mean(error < 0)),
+        "overestimation_pct": float(100.0 * np.mean(error > 0)),
+        "exact_pct": float(100.0 * np.mean(error == 0)),
         "insufficient_samples": bool(n < min_samples),
         "r2_defined": bool(r2_defined),
         "n_censored": int(group["target_censored"].sum()),
@@ -211,6 +219,11 @@ def metricas_desagregadas(
             row = dict(zip(group_columns, key))
             row.update(_group_metrics(group, min_samples))
             row["season_sources"] = "|".join(sorted(group["season_source"].dropna().astype(str).unique()))
+            row["season_interpretation"] = "calendar_label_not_observed_climate"
+            row["period_start"] = group["date"].min()
+            row["period_end"] = group["date"].max()
+            row["n_years"] = int(group["year"].nunique())
+            row["n_stations"] = int(group["station"].nunique())
             if "station" in dimensions:
                 spatial_columns = ["latitude", "longitude", "elevation"]
                 for column in spatial_columns:
@@ -224,12 +237,49 @@ def metricas_desagregadas(
     return outputs
 
 
+def metricas_por_banda_dqo(
+    predictions: pd.DataFrame,
+    train_targets,
+    min_samples: int = 5,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Evalúe por cuartiles cuyos límites se fijan exclusivamente con train.
+
+    Devuelve la tabla de métricas y otra tabla auditable con los límites. Los
+    límites repetidos se conservan: una banda puede quedar vacía si la DQO de
+    entrenamiento tiene muchos empates, en vez de mirar test para corregirla.
+    """
+    if isinstance(min_samples, bool) or not isinstance(min_samples, (int, np.integer)) or min_samples < 1:
+        raise ValueError("min_samples debe ser un entero positivo.")
+    train = np.asarray(train_targets, dtype=float).reshape(-1)
+    if not len(train) or not np.isfinite(train).all():
+        raise ValueError("train_targets debe contener DQO de entrenamiento finita.")
+    frame = _validate_predictions(predictions)
+    quantiles = np.quantile(train, [0.25, 0.50, 0.75])
+    labels = np.array(["baja", "media_baja", "media_alta", "alta"], dtype=object)
+    # side='left' asigna un valor igual al cuantil a la banda inferior.
+    frame["dqo_band"] = labels[np.searchsorted(quantiles, frame["y_true"].to_numpy(float), side="left")]
+    rows = []
+    for (model, split, band), group in frame.groupby(
+        ["model", "split", "dqo_band"], sort=True, observed=True
+    ):
+        row = {"model": model, "split": split, "dqo_band": band}
+        row.update(_group_metrics(group, min_samples))
+        rows.append(row)
+    boundaries = pd.DataFrame({
+        "quantile": [0.25, 0.50, 0.75],
+        "train_dqo": quantiles,
+        "source": "training_only",
+        "train_N": len(train),
+    })
+    return pd.DataFrame(rows), boundaries
+
+
 def guardar_evaluacion(
     predictions: pd.DataFrame,
     output_dir: str | Path,
     min_samples: int = 5,
 ) -> dict[str, pd.DataFrame]:
-    """Valide la cohorte y exporte predicciones y ocho tablas reproducibles.
+    """Valide la cohorte y exporte predicciones y tablas reproducibles.
 
     Los R2 no definidos se serializan como campos vacios del CSV. Los numeros
     conservan su precision; el formato visual se aplica solamente al graficar.

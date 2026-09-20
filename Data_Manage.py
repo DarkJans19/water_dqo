@@ -229,16 +229,36 @@ class Data_Manage:
         frame["season"], frame["season_source"] = seasons, sources
         return frame
 
-    def preparar_evaluacion(self, train_end=None, validation_end=None, train_ratio=0.6,
+    def preparar_evaluacion(self, train_end=None, validation_end=None, test_start=None, test_end=None, train_ratio=0.6,
                            validation_ratio=0.2, season_config=None, coverage_threshold=0.7,
-                           censored_target_policy="exclude"):
+                           censored_target_policy="exclude", ablate_groups=(),
+                           validation_stations=None, test_stations=None,
+                           allowed_chemical_features=None):
         if not 0 <= coverage_threshold <= 1:
             raise ValueError("coverage_threshold debe estar entre 0 y 1.")
         frame, chemical_features, report = self._cargar_muestras(censored_target_policy)
         frame = self._agregar_estacionalidad(frame, season_config)
-        if (train_end is None) != (validation_end is None):
+        station_split = validation_stations is not None or test_stations is not None
+        if station_split and (validation_stations is None or test_stations is None):
+            raise ValueError("Leave-station-out requiere validation_stations y test_stations.")
+        if station_split and (train_end is not None or validation_end is not None or test_start is not None or test_end is not None):
+            raise ValueError("No mezcle cortes temporales con leave-station-out.")
+        if not station_split and (train_end is None) != (validation_end is None):
             raise ValueError("Especifique ambos cortes: train_end y validation_end.")
-        if train_end is None:
+        if station_split:
+            validation_stations, test_stations = set(validation_stations), set(test_stations)
+            if not validation_stations or not test_stations or validation_stations & test_stations:
+                raise ValueError("Las estaciones de validación/prueba deben ser no vacías y disjuntas.")
+            known = set(frame.station)
+            unknown = (validation_stations | test_stations) - known
+            if unknown:
+                raise ValueError(f"Estaciones desconocidas en el split: {sorted(unknown)[:5]}")
+            frame["split"] = np.select(
+                [frame.station.isin(validation_stations), frame.station.isin(test_stations)],
+                ["validation", "test"], default="train"
+            )
+            train_end = validation_end = test_end = None
+        elif train_end is None:
             if not (0 < train_ratio < 1 and 0 < validation_ratio < 1 and train_ratio + validation_ratio < 1):
                 raise ValueError("Las proporciones deben ser positivas y sumar menos de 1.")
             date_mask = frame.y_true.notna()
@@ -251,10 +271,24 @@ class Data_Manage:
             train_end, validation_end = pd.Timestamp(days[train_n - 1]), pd.Timestamp(days[validation_n - 1])
         else:
             train_end, validation_end = pd.Timestamp(train_end).normalize(), pd.Timestamp(validation_end).normalize()
-        if pd.isna(train_end) or pd.isna(validation_end) or train_end >= validation_end:
-            raise ValueError("Los cortes deben satisfacer train_end < validation_end.")
-        dates = frame.date.dt.normalize()
-        frame["split"] = np.select([dates <= train_end, dates <= validation_end], ["train", "validation"], default="test")
+        if not station_split:
+            test_start = pd.Timestamp(test_start).normalize() if test_start is not None else None
+            test_end = pd.Timestamp(test_end).normalize() if test_end is not None else None
+            if (pd.isna(train_end) or pd.isna(validation_end) or train_end >= validation_end
+                    or (test_start is not None and (pd.isna(test_start) or validation_end >= test_start))
+                    or (test_end is not None and (pd.isna(test_end) or validation_end >= test_end))):
+                raise ValueError("Los cortes deben satisfacer train_end < validation_end < test_start/test_end.")
+            if test_start is not None and test_end is not None and test_start > test_end:
+                raise ValueError("test_start debe ser anterior o igual a test_end.")
+            dates = frame.date.dt.normalize()
+            if test_start is None and test_end is None:
+                frame["split"] = np.select([dates <= train_end, dates <= validation_end], ["train", "validation"], default="test")
+            else:
+                test_mask = dates >= (test_start if test_start is not None else validation_end + pd.Timedelta(days=1))
+                if test_end is not None:
+                    test_mask &= dates <= test_end
+                frame["split"] = np.select([dates <= train_end, dates <= validation_end, test_mask],
+                                            ["train", "validation", "test"], default="outside_evaluation")
         if censored_target_policy == 'train_half_limit':
             # Se rescatan etiquetas de entrenamiento, nunca verdad de evaluación.
             frame.loc[frame.target_censored & frame.split.ne('train'), 'y_true'] = np.nan
@@ -273,9 +307,30 @@ class Data_Manage:
         train = frame.split.eq("train")
         coverage = frame.loc[train, chemical_features].notna().mean()
         selected = coverage[(coverage >= coverage_threshold) & (coverage > 0)].index.tolist()
-        fixed = ["latitude", "longitude", "elevation", "year", "month_sin", "month_cos", "gap_days", "history_count",
-                 "days_since_previous_dqo", "dqo_lag_1", "dqo_lag_2", "dqo_lag_3"]
-        base_features = fixed + selected + [f"{c}__censored" for c in selected]
+        selected_before_availability = list(selected)
+        if allowed_chemical_features is not None:
+            allowed = set(allowed_chemical_features)
+            unknown = allowed - set(chemical_features)
+            if unknown:
+                raise ValueError(f"Predictores químicos desconocidos: {sorted(unknown)}")
+            selected = [feature for feature in selected if feature in allowed]
+        if isinstance(ablate_groups, str):
+            ablate_groups = (ablate_groups,)
+        ablate_groups = tuple(ablate_groups)
+        allowed_ablation_groups = {"historical_dqo", "geography", "time", "contemporary_covariates"}
+        unknown = set(ablate_groups) - allowed_ablation_groups
+        if unknown:
+            raise ValueError(f"Grupos de ablación desconocidos: {sorted(unknown)}")
+        feature_groups = {
+            "geography": ["latitude", "longitude", "elevation"],
+            "time": ["year", "month_sin", "month_cos", "gap_days", "history_count"],
+            "historical_dqo": ["days_since_previous_dqo", "dqo_lag_1", "dqo_lag_2", "dqo_lag_3"],
+            "contemporary_covariates": selected + [f"{c}__censored" for c in selected],
+        }
+        base_features = [feature for group, features in feature_groups.items()
+                         if group not in ablate_groups for feature in features]
+        if not base_features:
+            raise ValueError("La ablación no puede eliminar todos los predictores.")
         raw = frame[base_features].astype(float).replace([np.inf, -np.inf], np.nan)
         self.imputation_values_ = raw.loc[train].median().fillna(0.0)
         predictors = pd.concat([raw.fillna(self.imputation_values_), raw.isna().astype(float).add_suffix("__missing")], axis=1)
@@ -305,12 +360,26 @@ class Data_Manage:
             partitions[split] = Partition(values[selected_endpoints], values[selected_contexts],
                 self.target_scaler.transform(target_values.reshape(-1, 1)).ravel().astype(np.float32), metadata)
         self.sequence_indices_, self.sequence_endpoints_ = contexts, endpoints
-        split_config = {"strategy": "global_chronological_holdout", "train_end": train_end.isoformat(),
-                        "validation_end": validation_end.isoformat(), "sequence_length": self.sequence_length,
+        split_config = {"strategy": "leave_station_out" if station_split else "global_chronological_holdout",
+                        "train_end": train_end.isoformat() if train_end is not None else None,
+                        "validation_end": validation_end.isoformat() if validation_end is not None else None,
+                        "sequence_length": self.sequence_length,
+                        "test_start": test_start.isoformat() if test_start is not None else None,
+                        "test_end": test_end.isoformat() if test_end is not None else None,
                         "same_date_kept_together": True, "target_log1p": self.transformar_target_log,
                         "coverage_threshold": coverage_threshold, "censored_target_policy": censored_target_policy,
-                        "test_history_policy": "rolling_observed_past_results; no parameter refit"}
-        report.update(selected_chemical_features=selected, feature_count=len(self.feature_cols),
+                        "ablated_feature_groups": list(ablate_groups),
+                        "chemical_availability_filter_applied": allowed_chemical_features is not None,
+                        "allowed_chemical_features": sorted(allowed_chemical_features) if allowed_chemical_features is not None else None,
+                        "test_history_policy": "rolling_observed_past_results; no parameter refit",
+                        "validation_station_count": len(validation_stations) if station_split else None,
+                        "test_station_count": len(test_stations) if station_split else None}
+        report.update(selected_chemical_features=selected,
+                      selected_chemical_features_before_availability=selected_before_availability,
+                      excluded_by_availability=sorted(set(selected_before_availability)-set(selected)),
+                      chemical_availability_filter_applied=allowed_chemical_features is not None,
+                      feature_count=len(self.feature_cols),
+                      feature_groups=feature_groups, ablated_feature_groups=list(ablate_groups),
                       censored_training_labels_used=int(partitions['train'].metadata.target_censored.sum()),
                       censored_evaluation_labels_used=int(sum(partitions[s].metadata.target_censored.sum() for s in ('validation','test'))),
                       train_coverage={str(k): float(v) for k, v in coverage.items()},

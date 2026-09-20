@@ -6,6 +6,143 @@ El resultado principal es una tabla de **MAE, RMSE y R² en prueba**, impresa en
 `Diagnosis_Algorithms.py`, accesible como DataFrame y presentada con figuras en
 `Analisis_DQO.ipynb`. No se necesita dashboard ni archivos JSON.
 
+### Identificación de configuraciones
+
+Las etiquetas de modelo en `predictions`, `metrics`, `train_metrics` y los
+gráficos ahora distinguen la configuración efectiva. Por ejemplo, la ejecución
+por defecto produce `XGBoost_original` y `LSTM_original_64_d01`, mientras que
+`--improve-xgboost --regularize-lstm` produce nombres como
+`XGBoost_selected_raw_cov40_depth5` y `LSTM_selected_32_d03_physicalRMSE`.
+`resultados['model_labels']` relaciona el nombre solicitado en CLI con el nombre
+de salida y `resultados['model_configurations']` conserva transformación,
+cobertura, número de predictores, ablaciones e hiperparámetros.
+
+Esto corrige una ambigüedad histórica: dos ejecuciones diferentes compartían la
+misma etiqueta `XGBoost` o `LSTM`, aunque una usara otra transformación,
+cobertura, profundidad, unidades o criterio de parada. Los números no eran
+contradictorios; la identificación de la configuración era insuficiente.
+
+## Diagnósticos de magnitud, estabilidad y transferencia
+
+La evaluación principal ahora añade, sin usar prueba para definir grupos:
+
+- `metrics['dqo_band']`: cuatro bandas delimitadas por Q1/Q2/Q3 de la DQO de
+  **entrenamiento**. Informa N, MAE, RMSE, R², sesgo (`predicción - observado`),
+  mediana del error absoluto y porcentajes de sub/sobreestimación. Los límites
+  auditables están en `dqo_band_boundaries`. R² dentro de una banda estrecha no
+  sustituye el R² global y puede ser muy negativo por su baja varianza interna.
+- Todas las métricas desagregadas incluyen sesgo, mediana absoluta, porcentajes,
+  período, años y número de estaciones. `station_macro` contrasta el MAE global
+  ponderado por observaciones con media/mediana por estación, excluyendo del
+  macro las estaciones bajo `min_samples` pero informando cuántas excluye.
+- `hydro_zone_year`, `hydro_subzone_year` y `altitude_band_year` separan un año
+  difícil de una región-año difícil. Son descriptivos; grupos pequeños conservan
+  `insufficient_samples=True` y no justifican conclusiones locales.
+- `model_difference_uncertainty` usa bootstrap pareado por estación (2.000
+  réplicas). Remuestrear estaciones completas conserva la dependencia de las
+  observaciones repetidas mejor que remuestrear filas como si fueran independientes.
+
+Con el holdout 2020–2024, XGBoost obtuvo MAE 17,690. En la banda alta tuvo MAE
+41,710, sesgo −34,452 y 84,5 % de subestimaciones. La diferencia de MAE entre
+XGBoost y LSTM fue 1,061 a favor de XGBoost, IC95 % por estación [0,059; 2,110].
+Sólo 89 de 200 estaciones alcanzaron cinco casos; por ello una cifra local con
+pocos registros se presenta como evidencia insuficiente, no como mayor confiabilidad.
+
+### Varios orígenes temporales
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 Rolling_Origin_Evaluation.py
+```
+
+Usa cuatro pruebas no solapadas de dos años (2017–2018, 2019–2020, 2021–2022 y
+2023–2024), reentrena cada modelo y selecciona XGBoost sólo con la validación de
+cada origen. XGBoost ganó MAE en tres de cuatro ventanas (MAE medio 17,390), pero
+subestimó la banda alta en las cuatro: sesgo medio −27,172 y 74,0 % de
+subestimaciones. Esta repetición respalda que el fallo de picos no es exclusivo
+del corte principal.
+
+### Ablaciones y estaciones no vistas
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 Ablation_Experiments.py
+.\.venv\Scripts\python.exe -X utf8 Leave_Station_Out.py
+```
+
+Las ablaciones mantienen fijo XGBoost (objetivo sin log, cobertura 40 %,
+profundidad 5). Retirar covariables contemporáneas empeoró MAE de validación en
+7,422; retirar geografía en 0,541; DQO histórica en 0,210; y tiempo en 0,353.
+No se adopta ninguna ablación: la mejora de 0,120 al quitar tiempo apareció sólo
+en test y contradijo validación/RMSE.
+
+`Leave_Station_Out.py` forma cinco folds de estaciones completas. En cada fold,
+train, validación y test tienen intersección cero. Esta prueba aísla transferencia
+espacial y no debe describirse como pronóstico de años futuros. XGBoost obtuvo
+R² 0,645 y MAE 17,563 con historia local; para una estación nueva, eliminando
+lags de DQO, R² 0,632 y MAE 17,728. El sesgo alto siguió siendo negativo, por lo
+que la debilidad no parece explicarse principalmente por memorizar estaciones.
+
+### Modelo sensible a picos
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 Peak_Aware_Experiment.py
+```
+
+El experimento pondera observaciones por encima de Q3 de entrenamiento. Selecciona
+en validación el menor MAE alto sujeto a no empeorar MAE global más de 5 %. Peso
+2 redujo modestamente error y sesgo altos, pero en prueba elevó MAE global de
+17,690 a 18,745. Se conserva como alternativa para una función de costo que
+penalice especialmente subestimaciones altas; no reemplaza el modelo general.
+
+### Robustez multisemilla
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 Multi_Seed_Evaluation.py
+```
+
+Repite las configuraciones finales congeladas con semillas 7, 21, 42, 84 y 123.
+XGBoost ganó MAE en las cinco: MAE medio 17,991 (DE 0,270), frente a 18,702
+(DE 0,716) para LSTM. La desviación entre predicciones de semillas tuvo percentil
+95 de 8,757 mg O2/L en XGBoost y 20,652 en LSTM. La semilla 42 deja de ser la base
+única de la conclusión: XGBoost resulta mejor y más estable en este experimento.
+
+### Disponibilidad real de predictores
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 Predictor_Availability.py
+.\.venv\Scripts\python.exe -X utf8 Predictor_Availability.py --run-sensitivity
+```
+
+La auditoría marca inicialmente las 13 covariables químicas como `unverified`.
+El nombre de una propiedad no demuestra que se mida en campo ni que su resultado
+esté disponible antes que DQO. Para autorizar un modelo operacional se debe llenar
+`predictor_availability_template.csv`; cada `true` exige una fuente que documente
+método y tiempo de disponibilidad. El código rechaza un manifiesto incompleto.
+
+Como sensibilidad no confirmatoria, cinco variables candidatas de campo por nombre
+(conductividad, oxígeno disuelto, pH, temperatura y turbidez) obtuvieron MAE 19,700
+en validación y 19,651 en test, frente a 17,647 y 17,690 usando las 13 químicas.
+El desempeño sigue siendo útil (R² test 0,579), pero estas cinco tampoco se deben
+considerar disponibles hasta verificar el procedimiento real de IDEAM.
+
+Las tablas de temporada contienen `season_interpretation =
+calendar_label_not_observed_climate`. Las etiquetas seca/lluviosa son un proxy
+mensual descriptivo; no representan precipitación observada ni permiten atribuir
+causalmente el error al clima.
+
+### Confirmación futura
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 External_Validation.py `
+  --csv datos_actualizados.csv --external-start 2025-01-01
+```
+
+Este protocolo rechaza fechas de inicio iguales o anteriores al 23-11-2024,
+mantiene congeladas las configuraciones finales y excluye de las métricas el
+período ya inspeccionado. No puede ejecutarse todavía con el archivo actual porque
+no contiene observaciones futuras. Debe correrse una vez sobre datos nuevos; si
+después se ajusta el modelo mirando esos resultados, ese conjunto deja de ser una
+confirmación externa y pasa a ser desarrollo.
+
 ## Cómo ejecutarlo y dónde mirar
 
 ### Experimento de censura, agrupación regional y regularización LSTM

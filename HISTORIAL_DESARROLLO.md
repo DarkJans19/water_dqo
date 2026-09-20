@@ -3,6 +3,15 @@
 Este es el único documento de historial del proyecto. El flujo vigente está en
 `README.md` y el análisis visual en `Analisis_DQO.ipynb`.
 
+## Nomenclatura de ejecuciones
+
+Las salidas nuevas ya no usan `XGBoost`/`LSTM` como etiquetas ambiguas. Usan
+`XGBoost_original`, `XGBoost_selected_raw_cov40_depth5`,
+`LSTM_original_64_d01` y `LSTM_selected_32_d03_physicalRMSE`. El mapeo queda en
+`resultados['model_labels']` y la configuración efectiva en
+`resultados['model_configurations']`. Las tablas históricas siguientes conservan
+sus nombres originales para mantener trazabilidad.
+
 ## Protocolo estable
 
 - 134.261 filas largas se convierten en 6.835 combinaciones estación-fecha.

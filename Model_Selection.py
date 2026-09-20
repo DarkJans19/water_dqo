@@ -18,9 +18,12 @@ def seleccionar_xgboost(csv_path, target, reference, *, season_config=None, rand
         for coverage in (.7, .4, .15):
             data = Data_Manage(csv_path, target, sequence_length=cuts['sequence_length'],
                 random_state=random_state, transformar_target_log=target_log).preparar_evaluacion(
-                    train_end=cuts['train_end'], validation_end=cuts['validation_end'],
-                    season_config=season_config, coverage_threshold=coverage,
-                    censored_target_policy=cuts['censored_target_policy'])
+                train_end=cuts['train_end'], validation_end=cuts['validation_end'],
+                test_start=cuts.get('test_start'), test_end=cuts.get('test_end'), season_config=season_config,
+                coverage_threshold=coverage,
+                censored_target_policy=cuts['censored_target_policy'],
+                ablate_groups=cuts.get('ablated_feature_groups', ()),
+                allowed_chemical_features=cuts.get('allowed_chemical_features'))
             for split in ('train','validation','test'):
                 pd.testing.assert_frame_equal(data.partitions[split].metadata, reference.partitions[split].metadata)
             valid = data.partitions['validation']

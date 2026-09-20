@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["Diagnosis_Algorithms", "LSTM_Algorithm", "Data_Manage", "XGBoost_Algorithm", "SVM_Algorithm", "SpatioTemporal_Evaluation", "SpatioTemporal_Plots", "Error_Analysis", "Performance_Diagnostics", "Model_Selection", "Regional_Evaluation", "Experiment_Proposals"]
+py-modules = ["Diagnosis_Algorithms", "LSTM_Algorithm", "Data_Manage", "XGBoost_Algorithm", "SVM_Algorithm", "SpatioTemporal_Evaluation", "SpatioTemporal_Plots", "Error_Analysis", "Performance_Diagnostics", "Model_Selection", "Regional_Evaluation", "Experiment_Proposals", "Rolling_Origin_Evaluation", "Ablation_Experiments", "Leave_Station_Out", "Peak_Aware_Experiment", "Multi_Seed_Evaluation", "Predictor_Availability", "External_Validation"]
 
 [project.optional-dependencies]
 notebook = ["ipykernel", "jupyterlab"]

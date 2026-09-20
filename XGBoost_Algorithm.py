@@ -8,12 +8,16 @@ import numpy as np
 class XGBoost_Algorithm:
     name = "XGBoost"
 
-    def __init__(self, archivo_csv=None, target="DEMANDA QUIMICA DE OXIGENO", *, random_state=42, quick=False, max_depth=5):
+    def __init__(self, archivo_csv=None, target="DEMANDA QUIMICA DE OXIGENO", *, random_state=42, quick=False, max_depth=5,
+                 high_dqo_weight=1.0, high_dqo_quantile=0.75):
         self.archivo = archivo_csv
         self.target = target
         self.random_state = random_state
         self.quick = quick
         self.max_depth = max_depth
+        if high_dqo_weight < 1 or not 0 < high_dqo_quantile < 1:
+            raise ValueError("high_dqo_weight debe ser >=1 y high_dqo_quantile estar en (0,1).")
+        self.high_dqo_weight, self.high_dqo_quantile = high_dqo_weight, high_dqo_quantile
         self.model = None
         self.training_report = {}
 
@@ -41,13 +45,21 @@ class XGBoost_Algorithm:
         else:
             params["early_stopping_rounds"] = rounds
         self.model = XGBRegressor(**params)
-        self.model.fit(train.X, train.y, eval_set=[(train.X, train.y), (valid.X, valid.y)], verbose=False, **fit_params)
+        threshold = float(np.quantile(train.metadata.y_true.to_numpy(float), self.high_dqo_quantile))
+        sample_weight = np.where(train.metadata.y_true.to_numpy(float) > threshold,
+                                 self.high_dqo_weight, 1.0)
+        self.model.fit(train.X, train.y, sample_weight=sample_weight,
+                       eval_set=[(train.X, train.y), (valid.X, valid.y)], verbose=False, **fit_params)
         self.training_report = {
             "parameters": params, "early_stopping_rounds": rounds,
             "best_iteration": int(self.model.best_iteration),
             "selection_partition": "validation",
             "selection_metric": "RMSE of scaled log1p(DQO)" if prepared.target_log else "RMSE of scaled DQO",
             "history": self.model.evals_result(),
+            "sample_weighting": {"high_dqo_weight": self.high_dqo_weight,
+                                 "training_quantile": self.high_dqo_quantile,
+                                 "training_threshold": threshold,
+                                 "high_training_N": int((sample_weight > 1).sum())},
         }
         return self
 

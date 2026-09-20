@@ -16,7 +16,8 @@ import numpy as np
 import pandas as pd
 
 from Data_Manage import Data_Manage
-from SpatioTemporal_Evaluation import construir_predicciones, metricas_desagregadas, guardar_evaluacion, validar_cohorte
+from SpatioTemporal_Evaluation import (construir_predicciones, metricas_desagregadas,
+    metricas_por_banda_dqo, guardar_evaluacion, validar_cohorte)
 from Performance_Diagnostics import diagnosticar_desempeno
 
 DEFAULT_CSV = "Data_historica_de_calidad_de_agua_20260223.csv"
@@ -44,6 +45,31 @@ def _build_model(name, *, random_state, quick, sequence_length, epochs, batch_si
                           quick=quick, epochs=epochs, batch_size=batch_size)
 
 
+def _nombre_salida_modelo(name, estimator, data, *, improve_xgboost=False, selection_trials=None,
+                          regularize_lstm=False, target_log=True, coverage_threshold=0.7):
+    """Nombre inequívoco para tablas, archivos y comparaciones del notebook."""
+    if name == "XGBoost" and improve_xgboost:
+        selected = selection_trials.loc[selection_trials["selected"]].iloc[0]
+        transform = "log1p" if bool(selected["target_log"]) else "raw"
+        coverage = int(round(float(selected["coverage_threshold"]) * 100))
+        depth = int(selected["max_depth"])
+        return f"XGBoost_selected_{transform}_cov{coverage}_depth{depth}"
+    if name == "XGBoost":
+        # Conserva el nombre corto histórico sólo para la configuración por defecto.
+        if target_log and abs(float(coverage_threshold) - .7) < 1e-12:
+            return "XGBoost_original"
+        transform = "log1p" if target_log else "raw"
+        coverage = int(round(float(coverage_threshold) * 100))
+        return f"XGBoost_original_{transform}_cov{coverage}"
+    if name == "LSTM":
+        units = int(getattr(estimator, "units", 64))
+        # d01 representa dropout=0.1; d03 representa dropout=0.3.
+        dropout = int(round(float(getattr(estimator, "dropout", .1)) * 10))
+        suffix = "_physicalRMSE" if getattr(estimator, "monitor_original_rmse", False) else ""
+        return f"LSTM_{'selected' if regularize_lstm else 'original'}_{units}_d{dropout:02d}{suffix}"
+    return "SVM_original"
+
+
 def _tabla(table, columns=None):
     return table.loc[:, columns].to_string(index=False, float_format=lambda x: f"{x:.3f}") if columns else table.to_string(index=False, float_format=lambda x: f"{x:.3f}")
 
@@ -67,13 +93,35 @@ def mostrar_resultados(resultados, top_stations=10):
                 "\nMÉTRICAS POR AÑO: PRUEBA", _tabla(metrics['year'].query("split == 'test'"), ['model','year','N','MAE','RMSE','R2']),
                 "\nMÉTRICAS POR TEMPORADA: PRUEBA (calendario aproximado salvo configuración local)",
                 _tabla(metrics['season'].query("split == 'test'"), ['model','season','N','MAE','RMSE','R2']),
+                "\nERROR POR MAGNITUD DE DQO: PRUEBA (cuartiles fijados con entrenamiento)",
+                _tabla(metrics['dqo_band'].query("split == 'test'"),
+                       ['model','dqo_band','N','MAE','RMSE','R2','bias',
+                        'median_absolute_error','underestimation_pct','overestimation_pct']),
                 "\nESTACIONES CON MAYOR RMSE: PRUEBA (solo grupos con suficientes muestras)"]
     stations = metrics['station'].query("split == 'test' and not insufficient_samples")
     top = stations.sort_values('RMSE', ascending=False).groupby('model', sort=False).head(top_stations)
-    sections.append(_tabla(top, ['model','station','N','MAE','RMSE','R2']))
+    sections.append(_tabla(top, ['model','station','N','period_start','period_end','n_years',
+                                 'MAE','RMSE','R2','bias','median_absolute_error']))
+    if not diagnostics['station_macro'].empty:
+        global_test = metrics['global'].query("split == 'test'")[['model','MAE']].rename(columns={'MAE':'observation_weighted_MAE'})
+        macro_test = diagnostics['station_macro'].query("split == 'test'").merge(global_test, on='model', how='left')
+        sections.extend(["\nOBSERVACIONES VS ESTACIONES (macro sólo con evidencia suficiente)",
+                         _tabla(macro_test)])
     sections.extend(["\nCONCENTRACIÓN DEL ERROR", _tabla(diagnostics['error_concentration']),
                      "\nESTACIONES VISTAS / SIN ETIQUETAS DE ENTRENAMIENTO", _tabla(diagnostics['station_generalization']),
                      "\nLECTURA DEL DIAGNÓSTICO", *diagnostics['observations']])
+    if not diagnostics['model_difference_uncertainty'].empty:
+        sections.extend(["\nINCERTIDUMBRE DE DIFERENCIAS: PRUEBA (IC 95%, bootstrap por estación; A-B < 0 favorece A)",
+                         _tabla(diagnostics['model_difference_uncertainty'].query("split == 'test'"))])
+    for crossing in ('hydro_zone_year', 'hydro_subzone_year', 'altitude_band_year'):
+        table = metrics.get(crossing, pd.DataFrame())
+        if not table.empty:
+            dimensions = [column for column in ('hydro_zone','hydro_subzone','altitude_band') if column in table]
+            shown = (table.query("split == 'test' and not insufficient_samples")
+                     .sort_values(['model','MAE'], ascending=[True, False])
+                     .groupby('model', sort=False).head(5))
+            sections.extend([f"\nCRUCE {crossing}: CINCO GRUPOS CON MAYOR MAE POR MODELO",
+                             _tabla(shown, ['model',*dimensions,'year','N','n_stations','MAE','RMSE','bias'])])
     error_analysis = resultados.get('error_analysis')
     if error_analysis:
         sections.append("\nMODELO AUXILIAR DEL ERROR (su R² no es el R² de DQO)")
@@ -113,12 +161,13 @@ def mostrar_resultados(resultados, top_stations=10):
 
 def ejecutar_evaluacion(archivo_csv=DEFAULT_CSV, target="DEMANDA QUIMICA DE OXIGENO", *,
     output_dir="outputs/evaluacion_espaciotemporal", models=MODEL_NAMES,
-    train_end=None, validation_end=None, train_ratio=0.6, validation_ratio=0.2,
+    train_end=None, validation_end=None, test_start=None, test_end=None, train_ratio=0.6, validation_ratio=0.2,
     sequence_length=5, season_config=None, coverage_threshold=0.7,
     censored_target_policy="exclude", random_state=42, epochs=60, batch_size=32,
     min_samples=5, max_error_samples=300, quick=False, no_plots=False,
     no_error_analysis=False, model_instances=None, export_csv=False,
-    target_log=True, verbose=True, improve_xgboost=False, regularize_lstm=False):
+    target_log=True, verbose=True, improve_xgboost=False, regularize_lstm=False,
+    ablate_groups=(), allowed_chemical_features=None):
     """Devuelve resultados legibles en memoria; exportar CSV es optativo.
 
     Ajustes: train. Selección/early stopping: validation. Resultado: test.
@@ -135,13 +184,15 @@ def ejecutar_evaluacion(archivo_csv=DEFAULT_CSV, target="DEMANDA QUIMICA DE OXIG
     manager = Data_Manage(csv_path, target, sequence_length=sequence_length,
                           random_state=random_state, transformar_target_log=target_log)
     prepared = manager.preparar_evaluacion(train_end=train_end, validation_end=validation_end,
+        test_start=test_start, test_end=test_end,
         train_ratio=train_ratio, validation_ratio=validation_ratio, season_config=season_config,
-        coverage_threshold=coverage_threshold, censored_target_policy=censored_target_policy)
+        coverage_threshold=coverage_threshold, censored_target_policy=censored_target_policy,
+        ablate_groups=ablate_groups, allowed_chemical_features=allowed_chemical_features)
     if verbose:
         print('Muestras elegibles:', {s: len(p.y) for s,p in prepared.partitions.items()}, flush=True)
         print('Cortes temporales:', prepared.split_config['train_end'], prepared.split_config['validation_end'], flush=True)
     estimators, blocks, train_metrics, training = dict(model_instances or {}), [], [], {}
-    model_prepared, selection_trials = {}, None
+    model_prepared, selection_trials, model_labels, model_configurations = {}, None, {}, {}
     for name in names:
         if verbose:
             print(f'Entrenando {name}...', flush=True)
@@ -161,7 +212,23 @@ def ejecutar_evaluacion(archivo_csv=DEFAULT_CSV, target="DEMANDA QUIMICA DE OXIG
             estimator.fit(data, inverse_target=data.inverse_target)
         model_prepared[name] = data
         estimators[name] = estimator
-        training[name] = dict(estimator.training_report, elapsed_seconds=time.perf_counter()-started)
+        display_name = _nombre_salida_modelo(
+            name, estimator, data, improve_xgboost=improve_xgboost,
+            selection_trials=selection_trials, regularize_lstm=regularize_lstm,
+            target_log=data.target_log, coverage_threshold=data.split_config["coverage_threshold"]
+        )
+        model_labels[name] = display_name
+        training[name] = dict(estimator.training_report, elapsed_seconds=time.perf_counter()-started,
+                              output_name=display_name)
+        model_configurations[display_name] = {
+            "model_family": name, "target_log1p": bool(data.target_log),
+            "feature_count": len(data.feature_cols),
+            "coverage_threshold": data.split_config["coverage_threshold"],
+            "ablated_feature_groups": data.split_config.get("ablated_feature_groups", []),
+            "chemical_availability_filter_applied": data.split_config.get("chemical_availability_filter_applied", False),
+            "selected_chemical_features": data.quality_report.get("selected_chemical_features", []),
+            "training_parameters": estimator.training_report.get("parameters", {}),
+        }
         for split, part in data.partitions.items():
             prediction = np.asarray(data.inverse_target(estimator.predict(part)), dtype=float).reshape(-1)
             if len(prediction) != len(part.y) or not np.isfinite(prediction).all():
@@ -170,17 +237,25 @@ def ejecutar_evaluacion(archivo_csv=DEFAULT_CSV, target="DEMANDA QUIMICA DE OXIG
             truth = part.metadata.y_true.to_numpy(float)
             if split == 'train':
                 from Performance_Diagnostics import resumen_metricas
-                train_metrics.append(dict(model=name, split=split, **resumen_metricas(truth, prediction)))
+                train_metrics.append(dict(model=display_name, split=split, **resumen_metricas(truth, prediction)))
             else:
-                blocks.append(construir_predicciones(part.metadata, truth, prediction, name, split))
+                blocks.append(construir_predicciones(part.metadata, truth, prediction, display_name, split))
     predictions = pd.concat(blocks, ignore_index=True)
-    validar_cohorte(predictions, modelos_esperados=names)
+    validar_cohorte(predictions, modelos_esperados=list(model_labels.values()))
     tables = metricas_desagregadas(predictions, min_samples=min_samples)
+    dqo_bands, dqo_band_boundaries = metricas_por_banda_dqo(
+        predictions, prepared.partitions['train'].metadata.y_true.to_numpy(), min_samples=min_samples
+    )
+    tables['dqo_band'] = dqo_bands
     result = dict(predictions=predictions, metrics=tables, prepared=prepared, models=estimators,
                   model_prepared=model_prepared, selection_trials=selection_trials,
+                  model_labels=model_labels, model_configurations=model_configurations,
                   train_metrics=pd.DataFrame(train_metrics), training=training,
                   quality_report=prepared.quality_report, split_config=prepared.split_config,
-                  diagnostics=diagnosticar_desempeno(model_prepared[names[0]] if len(names) == 1 else prepared, predictions),
+                  dqo_band_boundaries=dqo_band_boundaries,
+                  diagnostics=diagnosticar_desempeno(
+                      model_prepared[names[0]] if len(names) == 1 else prepared, predictions,
+                      station_metrics=tables['station'], random_state=random_state),
                   error_analysis=None, plots=[], output_dir=str(Path(output_dir).resolve()))
     # Trazabilidad legible, sin manifiestos JSON.
     result['source_sha256'] = hashlib.sha256(csv_path.read_bytes()).hexdigest()
@@ -188,6 +263,8 @@ def ejecutar_evaluacion(archivo_csv=DEFAULT_CSV, target="DEMANDA QUIMICA DE OXIG
     result['regional_metrics'] = metricas_regionales(predictions)
     if export_csv:
         guardar_evaluacion(predictions, output_dir, min_samples=min_samples)
+        dqo_bands.to_csv(Path(output_dir)/'metrics_dqo_band.csv', index=False)
+        dqo_band_boundaries.to_csv(Path(output_dir)/'dqo_band_boundaries.csv', index=False)
         prepared.frame.to_csv(Path(output_dir)/'coverage.csv', index=False)
     if not no_error_analysis:
         from Error_Analysis import analizar_error
@@ -209,6 +286,8 @@ def build_parser():
     parser.add_argument('--target', default='DEMANDA QUIMICA DE OXIGENO')
     parser.add_argument('--train-end')
     parser.add_argument('--validation-end')
+    parser.add_argument('--test-end', help='Fin opcional de prueba; fechas posteriores quedan fuera de esta evaluación.')
+    parser.add_argument('--test-start', help='Inicio opcional de prueba; el intervalo previo queda fuera de evaluación.')
     parser.add_argument('--train-ratio', type=float, default=0.6)
     parser.add_argument('--validation-ratio', type=float, default=0.2)
     parser.add_argument('--sequence-length', type=int, default=5)
@@ -226,6 +305,9 @@ def build_parser():
     parser.add_argument('--raw-target', action='store_true', help='Experimento: entrenar sin log1p; conservar escalado train-only.')
     parser.add_argument('--improve-xgboost', action='store_true', help='Seleccionar transformación, cobertura y profundidad con validación temporal (12 candidatos).')
     parser.add_argument('--regularize-lstm', action='store_true', help='LSTM 32 unidades, dropout 0.3, parada por RMSE físico.')
+    parser.add_argument('--ablate-groups', nargs='*', default=(), choices=[
+        'historical_dqo', 'geography', 'time', 'contemporary_covariates'],
+        help='Diagnóstico: elimina grupos completos de predictores antes del ajuste.')
     return parser
 
 
