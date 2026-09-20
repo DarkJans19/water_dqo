@@ -81,12 +81,49 @@ class Data_Manage:
         text = Data_Manage._normalizar_texto(texto)
         return re.sub(r"\s+", " ", re.sub(r"\([^)]*\)|[^A-Z0-9 ]", " ", text)).strip()
 
-    def _resolver_target(self, columnas):
-        wanted = self._simplificar_texto(self.target)
-        candidates = [c for c in columnas if self._simplificar_texto(c) == wanted]
-        if len(candidates) != 1:
-            raise ValueError(f"Objetivo ambiguo o ausente: {self.target!r}; candidatos: {candidates}")
-        return candidates[0]
+    def _resolver_target(self, properties):
+        import unicodedata
+        import re
+
+        def normalizar(texto):
+            texto = str(texto).strip().upper()
+
+            # Quitar tildes/diacríticos
+            texto = unicodedata.normalize("NFKD", texto)
+            texto = "".join(
+                c for c in texto
+                if not unicodedata.combining(c)
+            )
+
+            # Unificar espacios
+            texto = re.sub(r"\s+", " ", texto)
+
+            return texto
+
+        target_normalizado = normalizar(self.target)
+
+        # 1. Intentar coincidencia exacta
+        exactos = [
+            p for p in properties
+            if normalizar(p) == target_normalizado
+        ]
+
+        if len(exactos) == 1:
+            return exactos[0]
+
+        # 2. Intentar coincidencia parcial
+        candidatos = [
+            p for p in properties
+            if target_normalizado in normalizar(p)
+        ]
+
+        if len(candidatos) == 1:
+            return candidatos[0]
+
+        raise ValueError(
+            f"Objetivo ambiguo o ausente: {self.target!r}; "
+            f"candidatos: {candidatos}"
+        )
 
     @staticmethod
     def _parsear_resultado(serie):
@@ -101,12 +138,67 @@ class Data_Manage:
     @staticmethod
     def _parsear_fechas(serie):
         raw = serie.astype("string").str.strip()
-        months = {name: f"{i:02d}" for i, name in enumerate(
-            ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
-        numeric = raw.str.replace(r"\b[A-Za-z]{3}\b", lambda m: months.get(m.group(), m.group()), regex=True)
-        dates = pd.to_datetime(numeric, format="%Y %m %d %I:%M:%S %p", errors="coerce")
-        iso = dates.isna() & raw.str.match(r"^\d{4}-\d{2}-\d{2}(?:[ T].*)?$", na=False)
-        dates.loc[iso] = pd.to_datetime(raw.loc[iso], format="ISO8601", errors="coerce")
+
+        dates = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
+
+        # 1. Formato actual del CSV IDEAM: DD/MM/YYYY
+        mask_dmy = raw.str.match(
+            r"^\d{1,2}/\d{1,2}/\d{4}$",
+            na=False
+        )
+
+        dates.loc[mask_dmy] = pd.to_datetime(
+            raw.loc[mask_dmy],
+            format="%d/%m/%Y",
+            errors="coerce"
+        )
+
+        # 2. Formato histórico con meses Jan, Feb, Mar...
+        remaining = dates.isna()
+
+        months = {
+            name: f"{i:02d}"
+            for i, name in enumerate(
+                [
+                    "Jan", "Feb", "Mar", "Apr",
+                    "May", "Jun", "Jul", "Aug",
+                    "Sep", "Oct", "Nov", "Dec"
+                ],
+                1
+            )
+        }
+
+        numeric = raw.loc[remaining].str.replace(
+            r"\b[A-Za-z]{3}\b",
+            lambda m: months.get(m.group(), m.group()),
+            regex=True
+        )
+
+        old_dates = pd.to_datetime(
+            numeric,
+            format="%Y %m %d %I:%M:%S %p",
+            errors="coerce"
+        )
+
+        dates.loc[remaining] = old_dates
+
+        # 3. Formato ISO: YYYY-MM-DD...
+        remaining = dates.isna()
+
+        iso = (
+            remaining
+            & raw.str.match(
+                r"^\d{4}-\d{2}-\d{2}(?:[ T].*)?$",
+                na=False
+            )
+        )
+
+        dates.loc[iso] = pd.to_datetime(
+            raw.loc[iso],
+            format="ISO8601",
+            errors="coerce"
+        )
+
         return dates
 
     def _cargar_muestras(self, censored_target_policy):

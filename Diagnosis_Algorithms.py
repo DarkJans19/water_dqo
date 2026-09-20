@@ -20,7 +20,7 @@ from SpatioTemporal_Evaluation import (construir_predicciones, metricas_desagreg
     metricas_por_banda_dqo, guardar_evaluacion, validar_cohorte)
 from Performance_Diagnostics import diagnosticar_desempeno
 
-DEFAULT_CSV = "Data_historica_de_calidad_de_agua_20260223.csv"
+DEFAULT_CSV = "Data_Histórica_de_Calidad_de_Agua_Superficial_y_Sedimentos_20260920.csv"
 MODEL_NAMES = ("XGBoost", "LSTM", "SVM")
 
 
